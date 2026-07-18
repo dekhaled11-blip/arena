@@ -9,7 +9,7 @@
  *   GET  /api/redemptions      (admin, Authorization: Bearer ADMIN_SECRET) -> قائمة الطلبات المعلّقة
  */
 
-const POINTS_PER_DIAMOND = 10; // معدل التحويل: كل 10 نقاط = جوهرة واحدة (عدّله حسب حساباتك)
+const POINTS_PER_DIAMOND = 1; // معدل التحويل: 1 نقطة = 1 جوهرة
 const CLAIM_THRESHOLD_POINTS = 100; // الحد الأدنى من النقاط قبل السماح بالمطالبة
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 7; // أسبوع
 
@@ -149,12 +149,19 @@ export default {
         const diamonds = Math.floor(user.points / POINTS_PER_DIAMOND);
         const points_cost = diamonds * POINTS_PER_DIAMOND; // يترك الباقي (fraction) في رصيد المستخدم
 
-        await env.DB.batch([
-          env.DB.prepare("UPDATE users SET points = points - ? WHERE id = ?").bind(points_cost, user.id),
-          env.DB.prepare(
-            "INSERT INTO redemptions (user_id, diamonds, points_cost) VALUES (?, ?, ?)"
-          ).bind(user.id, diamonds, points_cost),
-        ]);
+        // خصم ذري (atomic): ينجح فقط إذا كان الرصيد كافياً فعلياً وقت التنفيذ.
+        // هذا يمنع نجاح أكثر من طلب استبدال متزامن (مثلاً عند الضغط على الزر عدة مرات بسرعة).
+        const updateResult = await env.DB.prepare(
+          "UPDATE users SET points = points - ? WHERE id = ? AND points >= ?"
+        ).bind(points_cost, user.id, points_cost).run();
+
+        if (!updateResult.meta || updateResult.meta.changes === 0) {
+          return cors(json({ error: "تم تنفيذ طلب آخر بالفعل على نفس الرصيد، حدّث الصفحة وحاول مجدداً" }, 409));
+        }
+
+        await env.DB.prepare(
+          "INSERT INTO redemptions (user_id, diamonds, points_cost) VALUES (?, ?, ?)"
+        ).bind(user.id, diamonds, points_cost).run();
 
         return cors(json({ ok: true, diamonds, remaining_points: user.points - points_cost }));
       }
